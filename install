@@ -1,1 +1,13 @@
-!pip install optuna
+# المكتبات الأساسية
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install pandas numpy scikit-learn matplotlib seaborn
+pip install xgboost shap
+
+# مكتبة PyTorch Geometric (لـ GNN)
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+pip install torch-geometric
+
+# مكتبات إضافية
+pip install openpyxl  # لقراءة ملفات Excel
+pip install tqdm      # لشريط التقدم
+pip install joblib    # لحفظ النماذج
