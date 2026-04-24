@@ -1,0 +1,1490 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║          BrainSovereign KAN — MASTER UNIFIED SYSTEM (FINAL + MCI ENHANCED)     ║
+║          النظام الموحد الشامل — التنبؤ بمرض الزهايمر (مع تحسينات MCI)         ║
+╠══════════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  IMPROVEMENTS ADDED:                                                         ║
+║  ✅ Temporal difference features (ميزات الفروق الزمنية)                      ║
+║  ✅ Time-specific XGBoost models (نماذج منفصلة لكل أفق)                      ║
+║  ✅ Horizon-weighted loss (أوزان خاصة للآفاق البعيدة)                        ║
+║  ✅ Improved MetaFusion with stronger regularization                         ║
+║  ✅ Long-horizon ensemble (دمج خاص للـ 24 و 36 شهر)                          ║
+║  ✅ Long-term features for 36 months (ميزات المدى الطويل)                    ║
+║  ✅ Simplified model for 36 months (نموذج مبسط للـ 36 شهر)                   ║
+║  ✅ Feature selection for 36 months (اختيار الميزات)                         ║
+║  ✅ 🆕 MCI-specialized features (ميزات خاصة بـ MCI)                          ║
+║  ✅ 🆕 Two-stage classifier for better MCI detection                         ║
+║  ✅ 🆕 SMOTE augmentation for MCI samples                                     ║
+║  ✅ 🆕 Sliding windows for MCI pattern recognition                           ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMPORTS
+# ═══════════════════════════════════════════════════════════════════════════════
+import torch, pandas as pd, numpy as np, xgboost as xgb, warnings, gc, os
+import torch.nn as nn, torch.nn.functional as F, torch.optim as optim
+from torch_geometric.nn import GATv2Conv, GraphNorm
+from sklearn.preprocessing import RobustScaler, label_binarize
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+                             roc_auc_score, roc_curve, auc, classification_report)
+from sklearn.calibration import calibration_curve
+from sklearn.utils import resample
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import Patch
+import seaborn as sns
+import shap
+from matplotlib.backends.backend_pdf import PdfPages
+
+warnings.filterwarnings("ignore")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
+np.random.seed(SEED); torch.manual_seed(SEED)
+gc.collect()
+
+# ── Global constants ─────────────────────────────────────────────────────────
+CLASS_SHORT   = ["CN", "MCI", "AD"]
+CLASS_LONG    = ["CN (Normal)", "MCI (Mild Cognitive Impairment)", "AD (Alzheimer's)"]
+HORIZON_NAMES = ["Present", "12 Months", "24 Months", "36 Months"]
+COLORS        = {"CN": "#06A77D", "MCI": "#F7A825", "AD": "#E5383B"}
+NAVY          = "#0A1628"
+PANEL         = "#112240"
+CARD          = "#0D2137"
+TEAL          = "#00B4D8"
+TEAL_D        = "#0077B6"
+AMBER         = "#F7A825"
+PINK          = "#F72585"
+
+# 🆕 وزن أكبر للآفاق البعيدة (زيادة وزن 36 شهر)
+HORIZON_WEIGHTS = [1.0, 1.0, 1.5, 2.0]  # Present, 12M, 24M, 36M (وزن 36 شهر = 2.0)
+
+# 🆕 وزن أكبر لفئة MCI
+MCI_WEIGHT = 2.5  # زيادة وزن MCI لتحسين اكتشافها
+
+print(f"🖥️  Device: {device}")
+print("=" * 70)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — NEURAL BUILDING BLOCKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class KANLayer(nn.Module):
+    def __init__(self, in_f, out_f):
+        super().__init__()
+        self.base_linear   = nn.Linear(in_f, out_f)
+        self.spline_weight = nn.Parameter(torch.randn(out_f, in_f) * 0.1)
+
+    def forward(self, x):
+        return self.base_linear(x) + F.silu(x) @ self.spline_weight.t()
+
+
+class M1_GATv2(nn.Module):
+    def __init__(self, input_dim, hidden=128):
+        super().__init__()
+        self.gnn      = GATv2Conv(input_dim, hidden // 4, heads=4, dropout=0.3)
+        self.gnn_norm = GraphNorm(hidden)
+        self.pool     = nn.AdaptiveAvgPool1d(1)
+        self.heads    = nn.ModuleList([KANLayer(hidden, 3) for _ in range(4)])
+        self.register_buffer("edge_index", None)
+
+    def forward(self, x):
+        b, t, _ = x.shape
+        xg = self.gnn_norm(self.gnn(x.view(b * t, -1), self.edge_index)).view(b, t, -1)
+        ctx = self.pool(xg.permute(0, 2, 1)).squeeze(-1)
+        return [h(ctx) for h in self.heads], ctx
+
+    def build_edges(self, x_avg, top_k=4):
+        with torch.no_grad():
+            nm  = x_avg.norm(dim=1, keepdim=True)
+            sim = torch.mm(x_avg, x_avg.t()) / (torch.mm(nm, nm.t()) + 1e-8)
+            edges = [[i, j.item()] for i in range(sim.shape[0]) 
+                     for j in torch.topk(sim[i], k=top_k + 1).indices[1:]]
+            self.edge_index = torch.tensor(edges).t().contiguous().to(device)
+
+
+class M2_BiLSTM_Transformer(nn.Module):
+    def __init__(self, input_dim, hidden=256, n_layers=3):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden)
+        self.lstm = nn.LSTM(hidden, hidden // 2, bidirectional=True, batch_first=True, dropout=0.3)
+        enc = nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dim_feedforward=512, batch_first=True, dropout=0.3)
+        self.transformer = nn.TransformerEncoder(enc, num_layers=n_layers)
+        self.attn  = nn.Linear(hidden, 1)
+        self.heads = nn.ModuleList([KANLayer(hidden, 3) for _ in range(4)])
+
+    def forward(self, x):
+        x   = self.proj(x)
+        xl, _ = self.lstm(x)
+        xt  = self.transformer(xl)
+        w   = torch.softmax(self.attn(xt), dim=1)
+        ctx = (w * xt).sum(dim=1)
+        return [h(ctx) for h in self.heads], ctx
+
+
+class M3_BrainSovereign_KAN(nn.Module):
+    def __init__(self, input_dim, hidden=512, n_layers=6):
+        super().__init__()
+        self.gnn      = GATv2Conv(input_dim, hidden // 4, heads=4, dropout=0.4)
+        self.gnn_norm = GraphNorm(hidden)
+        self.lstm     = nn.LSTM(hidden, hidden // 2, bidirectional=True, batch_first=True, dropout=0.4)
+        enc = nn.TransformerEncoderLayer(d_model=hidden, nhead=8, dim_feedforward=2048, batch_first=True, dropout=0.4)
+        self.transformer = nn.TransformerEncoder(enc, num_layers=n_layers)
+        self.attn  = nn.Linear(hidden, 1)
+        self.heads = nn.ModuleList([KANLayer(hidden, 3) for _ in range(4)])
+        self.register_buffer("edge_index", None)
+
+    def forward(self, x):
+        b, t, _ = x.shape
+        xg = self.gnn_norm(self.gnn(x.view(b * t, -1), self.edge_index)).view(b, t, -1)
+        xl, _ = self.lstm(xg)
+        xt    = self.transformer(xl)
+        w     = torch.softmax(self.attn(xt), dim=1)
+        ctx   = (w * xt).sum(dim=1)
+        return [h(ctx) for h in self.heads], ctx
+
+    def build_edges(self, x_avg, top_k=4):
+        with torch.no_grad():
+            nm  = x_avg.norm(dim=1, keepdim=True)
+            sim = torch.mm(x_avg, x_avg.t()) / (torch.mm(nm, nm.t()) + 1e-8)
+            edges = [[i, j.item()] for i in range(sim.shape[0]) 
+                     for j in torch.topk(sim[i], k=top_k + 1).indices[1:]]
+            self.edge_index = torch.tensor(edges).t().contiguous().to(device)
+
+
+class M4_XGBoost_Fair:
+    def __init__(self):
+        self.models = []
+
+    def fit(self, emb_tr, Y_tr):
+        self.models = []
+        for i in range(4):
+            m = xgb.XGBClassifier(n_estimators=200, max_depth=6,
+                                   learning_rate=0.05, subsample=0.8,
+                                   colsample_bytree=0.8,
+                                   random_state=SEED + i, eval_metric="mlogloss")
+            m.fit(emb_tr, Y_tr[:, i])
+            self.models.append(m)
+        return self
+
+    def predict_proba_all(self, emb):
+        return [m.predict_proba(emb) for m in self.models]
+
+
+class M4_XGBoost_Flat:
+    def __init__(self):
+        self.models = []
+
+    def fit(self, X_last_visit, Y_tr):
+        self.models = []
+        for i in range(4):
+            m = xgb.XGBClassifier(n_estimators=100, max_depth=6,
+                                   random_state=SEED + i, eval_metric="mlogloss")
+            m.fit(X_last_visit, Y_tr[:, i])
+            self.models.append(m)
+        return self
+
+    def predict_proba_all(self, X_last_visit):
+        return [m.predict_proba(X_last_visit) for m in self.models]
+
+
+class M5_Improved_MetaFusion(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            KANLayer(input_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.5),
+            nn.SiLU(),
+            KANLayer(256, 128),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.4),
+            nn.SiLU(),
+            KANLayer(128, 64),
+            nn.Dropout(0.3),
+            nn.SiLU(),
+            nn.Linear(64, 3)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+
+# 🆕 TIME-SPECIFIC XGBoost with optimized params for 36 months
+class M4_TimeSpecific_XGBoost:
+    def __init__(self):
+        self.models = {}
+        self.feature_selectors = {}
+        
+    def fit(self, enhanced_emb_tr, Y_tr):
+        for horizon_idx, horizon_name in enumerate(HORIZON_NAMES):
+            y_horizon = Y_tr[:, horizon_idx]
+            
+            if horizon_name == "36 Months":
+                selector = SelectKBest(f_classif, k=50)
+                X_selected = selector.fit_transform(enhanced_emb_tr, y_horizon)
+                self.feature_selectors[horizon_name] = selector
+                params = {
+                    'n_estimators': 150,
+                    'max_depth': 4,
+                    'learning_rate': 0.02,
+                    'subsample': 0.5,
+                    'colsample_bytree': 0.5,
+                    'reg_alpha': 0.5,
+                    'reg_lambda': 2.0,
+                    'min_child_weight': 5,
+                    'random_state': SEED + horizon_idx
+                }
+            elif horizon_name in ["24 Months"]:
+                selector = SelectKBest(f_classif, k=100)
+                X_selected = selector.fit_transform(enhanced_emb_tr, y_horizon)
+                self.feature_selectors[horizon_name] = selector
+                params = {
+                    'n_estimators': 250,
+                    'max_depth': 6,
+                    'learning_rate': 0.03,
+                    'subsample': 0.7,
+                    'colsample_bytree': 0.7,
+                    'reg_alpha': 0.1,
+                    'reg_lambda': 1.0,
+                    'random_state': SEED + horizon_idx
+                }
+            else:
+                X_selected = enhanced_emb_tr
+                params = {
+                    'n_estimators': 200,
+                    'max_depth': 6,
+                    'learning_rate': 0.05,
+                    'subsample': 0.8,
+                    'colsample_bytree': 0.8,
+                    'random_state': SEED + horizon_idx
+                }
+            
+            self.models[horizon_name] = xgb.XGBClassifier(**params, eval_metric="mlogloss")
+            self.models[horizon_name].fit(X_selected, y_horizon)
+        return self
+    
+    def predict_proba(self, enhanced_emb, horizon_idx):
+        horizon_name = HORIZON_NAMES[horizon_idx]
+        model = self.models[horizon_name]
+        if horizon_name in self.feature_selectors:
+            X_input = self.feature_selectors[horizon_name].transform(enhanced_emb)
+        else:
+            X_input = enhanced_emb
+        return model.predict_proba(X_input)
+
+
+# 🆕 LONG-TERM FEATURES for 36 months
+def extract_long_term_features(patient):
+    features = []
+    if len(patient) >= 12:
+        first_half = patient[:6].mean(axis=0)
+        second_half = patient[6:].mean(axis=0)
+        long_term_trend = (second_half - first_half) / 6
+        features.extend(long_term_trend)
+    else:
+        features.extend(np.zeros(patient.shape[1]))
+    
+    if len(patient) >= 9:
+        early_rate = (patient[4] - patient[0]) / 4 if len(patient) > 4 else np.zeros(patient.shape[1])
+        late_rate = (patient[-1] - patient[-5]) / 4 if len(patient) > 5 else np.zeros(patient.shape[1])
+        long_acceleration = late_rate - early_rate
+        features.extend(long_acceleration)
+    else:
+        features.extend(np.zeros(patient.shape[1]))
+    
+    if len(patient) >= 8:
+        first_trend = np.sign(patient[2] - patient[0])
+        last_trend = np.sign(patient[-1] - patient[-3])
+        trend_change = last_trend - first_trend
+        features.extend(trend_change)
+    else:
+        features.extend(np.zeros(patient.shape[1]))
+    
+    long_term_std = patient.std(axis=0) if len(patient) > 0 else np.zeros(patient.shape[1])
+    features.extend(long_term_std)
+    
+    return np.array(features)
+
+
+# 🆕 MCI-SPECIFIC FEATURES
+def extract_mci_specific_features(patient, feature_names):
+    """
+    ميزات خاصة لاكتشاف وتحول MCI
+    """
+    features = []
+    
+    # قائمة الميزات المعرفية
+    cognitive_feats = ["MMSE", "ADAS13", "ADAS11", "CDRSB", "FAQ", "MOCA"]
+    cognitive_indices = [i for i, f in enumerate(feature_names) if any(c in f for c in cognitive_feats)]
+    
+    for idx in cognitive_indices:
+        values = patient[:, idx]
+        if len(values) > 1:
+            decline_rate = (values[-1] - values[0]) / len(values)
+            features.append(decline_rate)
+            if len(values) > 4:
+                early_decline = (values[3] - values[0]) / 3
+                late_decline = (values[-1] - values[-4]) / 3
+                acceleration = late_decline - early_decline
+                features.append(acceleration)
+        else:
+            features.extend([0, 0])
+    
+    # ميزة ضمور الحصين (Hippocampus atrophy)
+    if "Hippocampus" in feature_names:
+        hippo_idx = feature_names.index("Hippocampus")
+        hippo_values = patient[:, hippo_idx]
+        if len(hippo_values) > 1:
+            hippo_atrophy_rate = (hippo_values[0] - hippo_values[-1]) / len(hippo_values)
+            features.append(hippo_atrophy_rate)
+        else:
+            features.append(0)
+    
+    # ميزات عوامل الخطر
+    risk_factors = ["APOE4", "PTAU_UPENNBIOMK9", "ABETA_UPENNBIOMK9"]
+    risk_score = 0
+    risk_count = 0
+    for rf in risk_factors:
+        if rf in feature_names:
+            rf_idx = feature_names.index(rf)
+            risk_score += patient[-1, rf_idx]
+            risk_count += 1
+    if risk_count > 0:
+        features.append(risk_score / risk_count)
+    else:
+        features.append(0)
+    
+    return np.array(features)
+
+
+# 🆕 SLIDING WINDOWS for MCI pattern recognition
+def extract_mci_temporal_windows(patient_sequence, window_sizes=[3, 6, 9]):
+    features = []
+    seq_len = len(patient_sequence)
+    
+    for window_size in window_sizes:
+        if seq_len >= window_size:
+            last_window = patient_sequence[-window_size:]
+            window_mean = last_window.mean(axis=0)
+            window_std = last_window.std(axis=0)
+            window_trend = (last_window[-1] - last_window[0]) / window_size if window_size > 0 else np.zeros(patient_sequence.shape[1])
+            features.extend([window_mean, window_std, window_trend])
+        else:
+            features.extend([np.zeros(patient_sequence.shape[1]), np.zeros(patient_sequence.shape[1]), np.zeros(patient_sequence.shape[1])])
+    
+    return np.hstack(features)
+
+
+# 🆕 ENHANCED TEMPORAL FEATURES (with long-term and MCI-specific)
+def extract_enhanced_features_v3(X, feature_names):
+    """
+    نسخة محسنة من استخراج الميزات تشمل المدى الطويل وميزات MCI
+    """
+    enhanced_features = []
+    
+    for patient in X:
+        # الميزات الأساسية (قصيرة المدى)
+        last_visit = patient[-1]
+        differences = np.diff(patient, axis=0)
+        
+        if len(differences) > 0:
+            mean_rate = differences.mean(axis=0)
+            std_rate = differences.std(axis=0)
+            trend = np.sign(differences).mean(axis=0)
+        else:
+            mean_rate = np.zeros(patient.shape[1])
+            std_rate = np.zeros(patient.shape[1])
+            trend = np.zeros(patient.shape[1])
+        
+        if len(differences) > 1:
+            acceleration = np.diff(differences, axis=0).mean(axis=0)
+        else:
+            acceleration = np.zeros_like(mean_rate)
+        
+        stability = patient.std(axis=0)
+        mean_patient = patient.mean(axis=0)
+        deviations = np.abs(patient - mean_patient).max(axis=0)
+        
+        if len(differences) >= 3:
+            last_3_diffs = differences[-3:].flatten()
+        elif len(differences) > 0:
+            last_3_diffs = np.pad(differences.flatten(), (0, 3*len(mean_rate) - len(differences.flatten())), 'constant')
+        else:
+            last_3_diffs = np.zeros(3*len(mean_rate))
+        
+        # ميزات المدى الطويل
+        long_term = extract_long_term_features(patient)
+        
+        # 🆕 ميزات MCI الخاصة
+        mci_specific = extract_mci_specific_features(patient, feature_names)
+        
+        # 🆕 النوافذ الزمنية
+        windows = extract_mci_temporal_windows(patient)
+        
+        # دمج جميع الميزات
+        patient_features = np.hstack([
+            last_visit,           # 34
+            mean_rate,            # 34
+            std_rate,             # 34
+            acceleration,         # 34
+            trend,                # 34
+            stability,            # 34
+            deviations,           # 34
+            last_3_diffs,         # 102
+            long_term,            # 136 (4 × 34)
+            mci_specific,         # ~19
+            windows               # 306 (3 × 3 × 34)
+        ])
+        
+        enhanced_features.append(patient_features)
+    
+    return np.array(enhanced_features)
+
+
+# 🆕 TWO-STAGE CLASSIFIER FOR MCI (FIXED)
+class TwoStageMCI_Classifier:
+    """
+    Two-Stage Classifier specialized for MCI detection
+    Stage 1: CN vs (MCI+AD)
+    Stage 2: MCI vs AD (binary)
+    """
+    def __init__(self):
+        self.stage1_model = None
+        self.stage2_model = None
+        self.stage1_threshold = 0.5
+        
+    def fit(self, X, Y):
+        print(f"     Training Stage 1: CN vs Abnormal...")
+        # Stage 1: Binary classification (CN=0, Abnormal=1)
+        y_stage1 = (Y > 0).astype(int)
+        
+        self.stage1_model = xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.05,
+            objective='binary:logistic',
+            random_state=SEED,
+            scale_pos_weight=1.5,
+            eval_metric='logloss',
+            use_label_encoder=False
+        )
+        self.stage1_model.fit(X, y_stage1)
+        
+        # Stage 2: Only for abnormal cases, classify MCI vs AD
+        abnormal_mask = y_stage1 == 1
+        if abnormal_mask.sum() > 0:
+            print(f"     Training Stage 2: MCI vs AD (n={abnormal_mask.sum()})...")
+            X_stage2 = X[abnormal_mask]
+            Y_stage2 = Y[abnormal_mask]
+            
+            # Convert: MCI=0, AD=1 for binary classification
+            Y_stage2_binary = (Y_stage2 == 2).astype(int)
+            
+            self.stage2_model = xgb.XGBClassifier(
+                n_estimators=150,
+                max_depth=5,
+                learning_rate=0.05,
+                objective='binary:logistic',
+                random_state=SEED,
+                scale_pos_weight=1.0,
+                eval_metric='logloss',
+                use_label_encoder=False
+            )
+            self.stage2_model.fit(X_stage2, Y_stage2_binary)
+        else:
+            print("     Warning: No abnormal samples found for Stage 2!")
+            self.stage2_model = None
+            
+        return self
+    
+    def predict_proba(self, X):
+        # Stage 1 prediction
+        prob_stage1 = self.stage1_model.predict_proba(X)
+        # prob_stage1[:, 0] = P(CN)
+        # prob_stage1[:, 1] = P(Abnormal)
+        
+        final_probs = np.zeros((X.shape[0], 3))
+        
+        # Cases predicted as normal
+        normal_mask = prob_stage1[:, 0] > self.stage1_threshold
+        final_probs[normal_mask, 0] = prob_stage1[normal_mask, 0]
+        final_probs[normal_mask, 1] = prob_stage1[normal_mask, 1] * 0.5
+        final_probs[normal_mask, 2] = prob_stage1[normal_mask, 1] * 0.5
+        
+        # Cases predicted as abnormal
+        abnormal_mask = ~normal_mask
+        if abnormal_mask.sum() > 0 and self.stage2_model is not None:
+            prob_stage2 = self.stage2_model.predict_proba(X[abnormal_mask])
+            # prob_stage2[:, 0] = P(MCI)
+            # prob_stage2[:, 1] = P(AD)
+            
+            abnormal_prob = prob_stage1[abnormal_mask, 1]
+            final_probs[abnormal_mask, 1] = prob_stage2[:, 0] * abnormal_prob
+            final_probs[abnormal_mask, 2] = prob_stage2[:, 1] * abnormal_prob
+            final_probs[abnormal_mask, 0] = 1 - abnormal_prob
+            
+            # Normalize to ensure sum = 1
+            row_sum = final_probs[abnormal_mask].sum(axis=1)
+            final_probs[abnormal_mask] = final_probs[abnormal_mask] / row_sum[:, np.newaxis]
+        
+        return final_probs
+
+
+class LongHorizonEnsemble:
+    def __init__(self):
+        self.weights = {
+            "24 Months": {"m4": 0.7, "m5": 0.3},
+            "36 Months": {"m4": 0.6, "m5": 0.4}
+        }
+        
+    def predict(self, horizon_idx, m4_probs, m5_probs):
+        horizon_name = HORIZON_NAMES[horizon_idx]
+        if horizon_name in self.weights:
+            w = self.weights[horizon_name]
+            return w["m4"] * m4_probs + w["m5"] * m5_probs
+        else:
+            return m4_probs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — DATA PREPARATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def prepare_data(path, seq_len=12):
+    print("\n" + "═" * 70)
+    print("📦  PHASE 1 — DATA PREPARATION  |  تحضير البيانات")
+    print("═" * 70)
+
+    df = pd.read_csv(path).sort_values(["RID", "Years_bl"]).fillna(0)
+
+    structural = ["Hippocampus","WholeBrain","Entorhinal","Ventricles",
+                  "Fusiform","MidTemp","ICV"]
+    biomarkers = ["ABETA_UPENNBIOMK9_04_19_17","TAU_UPENNBIOMK9_04_19_17",
+                  "PTAU_UPENNBIOMK9_04_19_17","AV45","FDG"]
+    cognitive  = ["MMSE","ADAS13","ADAS11","CDRSB","FAQ","MOCA",
+                  "RAVLT_immediate","RAVLT_learning","RAVLT_forgetting"]
+    demo       = ["AGE","APOE4","PTEDUCAT","PTGENDER"]
+    dti_cols   = [c for c in df.columns if "DTI" in c]
+    feats = [f for f in (structural + biomarkers + cognitive + demo + dti_cols)
+             if f in df.columns]
+
+    print(f"  ✅ Features found: {len(feats)}")
+    print(f"     Structural:{len([f for f in structural if f in df.columns])}  "
+          f"Biomarkers:{len([f for f in biomarkers if f in df.columns])}  "
+          f"Cognitive:{len([f for f in cognitive if f in df.columns])}  "
+          f"Demo:{len([f for f in demo if f in df.columns])}  "
+          f"DTI:{len(dti_cols)}")
+
+    clin = [c for c in ["MMSE","ADAS13","CDRSB","FAQ","Hippocampus","WholeBrain"]
+            if c in df.columns]
+    plt.figure(figsize=(9, 7))
+    sns.heatmap(df[clin].corr(), annot=True, cmap="RdBu_r", center=0,
+                fmt=".2f", linewidths=0.5)
+    plt.title("Clinical Feature Correlation Matrix", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("clinical_correlation.png", dpi=150)
+    plt.close()
+
+    df[feats] = RobustScaler().fit_transform(df[feats])
+
+    X, Y = [], []
+    for rid in df["RID"].unique():
+        p = df[df["RID"] == rid]
+        if len(p) < 5:
+            continue
+        raw  = p[feats].values
+        base = raw[:-4]
+        pad  = (np.pad(base, ((seq_len - len(base), 0), (0, 0)), mode="edge")
+                if len(base) < seq_len else base[-seq_len:])
+        X.append(pad)
+        Y.append([p["DX_num"].iloc[-4], p["DX_num"].iloc[-3],
+                  p["DX_num"].iloc[-2], p["DX_num"].iloc[-1]])
+
+    X, Y = np.array(X), np.array(Y).astype(int)
+
+    max_s = min(pd.Series(Y[:, 0]).value_counts().max(), 500)
+    Xb, Yb = [], []
+    for cv in np.unique(Y[:, 0]):
+        xf, yf = resample(X[Y[:, 0] == cv], Y[Y[:, 0] == cv],
+                          n_samples=max_s, random_state=SEED)
+        Xb.append(xf); Yb.append(yf)
+    Xa, Ya = np.vstack(Xb), np.vstack(Yb)
+
+    Xtr, Xte, Ytr, Yte = train_test_split(Xa, Ya, test_size=0.15, random_state=SEED)
+    print(f"  Train: {Xtr.shape[0]}  |  Test: {Xte.shape[0]}  |  "
+          f"Seq:{seq_len}  Features:{len(feats)}")
+    return Xtr, Xte, Ytr, Yte, feats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — TRAINING UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_torch(model, Xtr, Ytr, Xval, Yval,
+                epochs=120, lr=1e-4, cw=None, patience=12, tag="Model"):
+    weights = torch.tensor(cw if cw else [1., 1., 1.]).to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    xt = torch.tensor(Xtr, dtype=torch.float32).to(device)
+    yt = torch.tensor(Ytr).to(device)
+    xv = torch.tensor(Xval, dtype=torch.float32).to(device)
+    yv = torch.tensor(Yval).to(device)
+
+    best_loss, best_state, trigger = float("inf"), None, 0
+    tr_losses, va_losses = [], []
+
+    for ep in range(1, epochs + 1):
+        model.train(); opt.zero_grad()
+        outs, _ = model(xt)
+        loss = sum(F.cross_entropy(outs[j], yt[:, j], weight=weights, label_smoothing=0.1)
+                   for j in range(4))
+        loss.backward(); opt.step(); sch.step()
+        tr_losses.append(loss.item())
+
+        model.eval()
+        with torch.no_grad():
+            vo, _ = model(xv)
+            vloss = sum(F.cross_entropy(vo[j], yv[:, j]) for j in range(4))
+            va_losses.append(vloss.item())
+
+        if vloss < best_loss:
+            best_loss = vloss.item()
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            trigger = 0
+        else:
+            trigger += 1
+            if trigger >= patience:
+                print(f"    ↩ Early stop @ epoch {ep}")
+                break
+
+        if ep % 30 == 0:
+            print(f"    [{tag}] Ep {ep:03d} | Train {loss.item():.4f} | Val {vloss.item():.4f}")
+
+    model.load_state_dict(best_state)
+    return model, tr_losses, va_losses
+
+
+def train_torch_improved(model, Xtr, Ytr, Xval, Yval,
+                         epochs=150, lr=1e-4, cw=None, patience=15, tag="Model"):
+    weights = torch.tensor(cw if cw else [1., 1., 1.]).to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    horizon_weights = torch.tensor(HORIZON_WEIGHTS).to(device)
+
+    xt = torch.tensor(Xtr, dtype=torch.float32).to(device)
+    yt = torch.tensor(Ytr).to(device)
+    xv = torch.tensor(Xval, dtype=torch.float32).to(device)
+    yv = torch.tensor(Yval).to(device)
+
+    best_loss, best_state, trigger = float("inf"), None, 0
+    tr_losses, va_losses = [], []
+
+    for ep in range(1, epochs + 1):
+        model.train(); opt.zero_grad()
+        outs, _ = model(xt)
+        loss = sum(horizon_weights[j] * F.cross_entropy(outs[j], yt[:, j], weight=weights, label_smoothing=0.1)
+                   for j in range(4))
+        loss.backward(); opt.step(); sch.step()
+        tr_losses.append(loss.item())
+
+        model.eval()
+        with torch.no_grad():
+            vo, _ = model(xv)
+            vloss = sum(F.cross_entropy(vo[j], yv[:, j]) for j in range(4))
+            va_losses.append(vloss.item())
+
+        if vloss < best_loss:
+            best_loss = vloss.item()
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            trigger = 0
+        else:
+            trigger += 1
+            if trigger >= patience:
+                print(f"    ↩ Early stop @ epoch {ep}")
+                break
+
+        if ep % 30 == 0:
+            print(f"    [{tag}] Ep {ep:03d} | Train {loss.item():.4f} | Val {vloss.item():.4f}")
+
+    model.load_state_dict(best_state)
+    return model, tr_losses, va_losses
+
+
+def get_probs(model, X):
+    model.eval()
+    with torch.no_grad():
+        outs, emb = model(torch.tensor(X, dtype=torch.float32).to(device))
+    return [F.softmax(o, dim=1).cpu().numpy() for o in outs], emb
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — EVALUATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def evaluate(probs_list, Yte, name):
+    results = []
+    for i, (probs, hn) in enumerate(zip(probs_list, HORIZON_NAMES)):
+        preds = np.argmax(probs, axis=1)
+        yt    = Yte[:, i]
+        ybin  = label_binarize(yt, classes=[0, 1, 2])
+
+        acc = accuracy_score(yt, preds) * 100
+        f1m = f1_score(yt, preds, average="macro", zero_division=0) * 100
+        f1w = f1_score(yt, preds, average="weighted", zero_division=0) * 100
+        fpc = f1_score(yt, preds, average=None, zero_division=0) * 100
+
+        try:
+            am = roc_auc_score(ybin, probs, average="macro", multi_class="ovr") * 100
+            aw = roc_auc_score(ybin, probs, average="weighted", multi_class="ovr") * 100
+        except Exception:
+            am = aw = 0.0
+
+        apc = []
+        for c in range(3):
+            if ybin[:, c].sum() > 0:
+                fpr, tpr, _ = roc_curve(ybin[:, c], probs[:, c])
+                apc.append(auc(fpr, tpr) * 100)
+            else:
+                apc.append(0.0)
+
+        cm = confusion_matrix(yt, preds, labels=[0, 1, 2])
+        results.append({
+            "model": name, "horizon": hn,
+            "acc": acc, "f1_macro": f1m, "f1_weighted": f1w,
+            "auc_macro": am, "auc_weighted": aw,
+            "f1_CN": fpc[0] if len(fpc) > 0 else 0,
+            "f1_MCI": fpc[1] if len(fpc) > 1 else 0,
+            "f1_AD": fpc[2] if len(fpc) > 2 else 0,
+            "auc_CN": apc[0], "auc_MCI": apc[1], "auc_AD": apc[2],
+            "cm": cm, "probs": probs, "preds": preds
+        })
+        print(f"  {name:<26s} | {hn:<12s} | Acc:{acc:5.1f}% | F1:{f1m:5.1f}% | AUC:{am:5.1f}%")
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — SHAP ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_shap_global(xgb_flat_models, Xte_last_visit, feat_names, pdf):
+    print("\n  🔬 SHAP Global Analysis...")
+    for i, (m, hn) in enumerate(zip(xgb_flat_models, HORIZON_NAMES)):
+        try:
+            explainer   = shap.TreeExplainer(m)
+            sv          = explainer.shap_values(Xte_last_visit[:80])
+            sv_plot     = sv[0] if isinstance(sv, list) else sv
+
+            fig, ax = plt.subplots(figsize=(13, 9))
+            fig.patch.set_facecolor(NAVY)
+            shap.summary_plot(sv_plot, Xte_last_visit[:80],
+                              feature_names=feat_names, show=False,
+                              max_display=20, color_bar=True)
+            ax = plt.gca(); ax.set_facecolor(PANEL)
+            ax.tick_params(colors="white"); ax.xaxis.label.set_color("white")
+            ax.yaxis.label.set_color("white")
+            plt.title(f"SHAP Feature Importance — {hn}  |  أهمية الميزات: {hn}",
+                      color="white", fontsize=13, fontweight="bold")
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            print(f"    ✓ {hn}")
+        except Exception as e:
+            print(f"    ⚠ SHAP skipped ({hn}): {e}")
+
+
+def run_shap_patient(xgb_flat_model, patient_last_visit, feat_names,
+                     patient_idx, horizon_name, predicted_class):
+    try:
+        explainer  = shap.TreeExplainer(xgb_flat_model)
+        sv         = explainer.shap_values(patient_last_visit.reshape(1, -1))
+        sv_class   = (sv[predicted_class][0] if isinstance(sv, list) else
+                      (sv[0] if len(sv.shape) > 1 else sv))
+        if hasattr(sv_class, "shape") and len(sv_class.shape) > 1:
+            sv_class = sv_class.flatten()
+
+        fi = sorted([{"feature": n, "shap_value": float(v), "abs_shap": abs(float(v))}
+                     for n, v in zip(feat_names, sv_class)],
+                    key=lambda x: x["abs_shap"], reverse=True)
+        return fi
+    except Exception as e:
+        print(f"    ⚠ Patient SHAP failed: {e}")
+        return []
+
+
+def plot_patient_shap_bar(fi, patient_idx, horizon_name, pdf):
+    if not fi:
+        return
+    top   = fi[:15]
+    feats = [f["feature"][:38] + "…" if len(f["feature"]) > 38 else f["feature"] for f in top]
+    vals  = [f["shap_value"] for f in top]
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    fig.patch.set_facecolor(NAVY); ax.set_facecolor(PANEL)
+    colors = ["#E5383B" if v > 0 else "#00B4D8" for v in vals]
+    ax.barh(range(len(feats)), vals, color=colors, alpha=0.82, edgecolor="none")
+    ax.set_yticks(range(len(feats))); ax.set_yticklabels(feats, fontsize=9, color="white")
+    ax.axvline(0, color="white", linewidth=1)
+    ax.set_xlabel("SHAP Value", color="white", fontsize=11)
+    ax.tick_params(colors="white"); ax.spines[:].set_color("#1E3A52")
+    ax.set_title(f"Patient #{patient_idx} — {horizon_name}\nFeature Impact (SHAP)",
+                 color="white", fontsize=12, fontweight="bold")
+    legend_els = [Patch(facecolor="#E5383B", alpha=0.8, label="↑ Increases risk"),
+                  Patch(facecolor="#00B4D8", alpha=0.8, label="↓ Decreases risk")]
+    ax.legend(handles=legend_els, framealpha=0, labelcolor="white", fontsize=9)
+    ax.grid(True, alpha=0.2, axis="x")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — CLINICAL PATIENT DIAGNOSIS (FIXED)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def diagnose_patient_console(pid, Xte, Yte, all_probs, model_names):
+    print(f"\n{'═'*70}")
+    print(f"🩺  PATIENT #{pid} — Full Multi-Model Diagnosis")
+    print(f"{'═'*70}")
+    tl = Yte[pid]
+    print(f"  📋 TRUE:  {' → '.join(CLASS_SHORT[l] for l in tl)}"
+          f"  ({' | '.join(HORIZON_NAMES)})")
+    
+    n_models = min(len(model_names), len(all_probs))
+    for idx in range(n_models):
+        mn = model_names[idx]
+        pl = all_probs[idx]
+        print(f"\n  🔷 {mn}:")
+        for i, (p, hn) in enumerate(zip(pl, HORIZON_NAMES)):
+            pp   = p[pid]; cls = np.argmax(pp); conf = pp[cls] * 100
+            ok   = "✅" if cls == tl[i] else "❌"
+            print(f"     {ok} {hn:<12s}: {CLASS_SHORT[cls]:<4s} ({conf:.1f}%) | "
+                  f"CN={pp[0]:.2%} MCI={pp[1]:.2%} AD={pp[2]:.2%}")
+
+
+def plot_patient_clinical(pid, Yte, m3_probs_per_horizon,
+                          all_probs, model_names,
+                          xgb_flat_models, Xte_last_visit, feat_names, pdf):
+    tl       = Yte[pid]
+    p_probs  = [m3_probs_per_horizon[i][pid] for i in range(4)]
+
+    n_models = len(model_names)
+    n_probs = len(all_probs)
+    
+    if n_models > n_probs:
+        model_names = model_names[:n_probs]
+    elif n_probs > n_models:
+        all_probs = all_probs[:n_models]
+
+    fig = plt.figure(figsize=(18, 11))
+    fig.patch.set_facecolor(NAVY)
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+    ax0 = fig.add_subplot(gs[0, 0]); ax0.set_facecolor(PANEL)
+    for ci, (cls, col) in enumerate(zip(CLASS_SHORT, [COLORS["CN"], COLORS["MCI"], COLORS["AD"]])):
+        ax0.plot(HORIZON_NAMES, [p_probs[h][ci] * 100 for h in range(4)],
+                 marker="o", color=col, linewidth=2.5, label=cls)
+    ax0.set_ylim(0, 105); ax0.set_title("Disease Trajectory (M3)", color="white", fontsize=11)
+    ax0.tick_params(colors="white"); ax0.spines[:].set_color("#1E3A52")
+    ax0.set_ylabel("Probability (%)", color="white"); ax0.legend(framealpha=0, labelcolor="white")
+    ax0.grid(True, alpha=0.2)
+
+    ax1 = fig.add_subplot(gs[0, 1]); ax1.set_facecolor(PANEL)
+    bars = ax1.bar(CLASS_SHORT, [p_probs[0][c] * 100 for c in range(3)],
+                   color=[COLORS["CN"], COLORS["MCI"], COLORS["AD"]], alpha=0.85)
+    for b, v in zip(bars, p_probs[0]):
+        ax1.text(b.get_x() + b.get_width() / 2, b.get_height() + 1.5,
+                 f"{v:.0%}", ha="center", color="white", fontsize=10, fontweight="bold")
+    pred_now = CLASS_SHORT[np.argmax(p_probs[0])]
+    ok_now   = "✅" if np.argmax(p_probs[0]) == tl[0] else "❌"
+    ax1.set_title(f"Current Status {ok_now}\nTrue:{CLASS_SHORT[tl[0]]} | Pred:{pred_now}",
+                  color="white", fontsize=11)
+    ax1.set_ylim(0, 115); ax1.tick_params(colors="white"); ax1.spines[:].set_color("#1E3A52")
+
+    ax2 = fig.add_subplot(gs[0, 2]); ax2.set_facecolor(PANEL)
+    mat = np.array([[p_probs[h][c] * 100 for c in range(3)] for h in range(4)])
+    im  = ax2.imshow(mat, cmap="RdYlGn", vmin=0, vmax=100, aspect="auto")
+    ax2.set_xticks(range(3)); ax2.set_xticklabels(CLASS_SHORT, color="white")
+    ax2.set_yticks(range(4)); ax2.set_yticklabels(HORIZON_NAMES, color="white", fontsize=9)
+    ax2.set_title("Probability Heatmap (M3)", color="white", fontsize=11)
+    plt.colorbar(im, ax=ax2, label="Prob %").ax.yaxis.set_tick_params(color="white")
+    for (r, c_), v in np.ndenumerate(mat):
+        ax2.text(c_, r, f"{v:.0f}", ha="center", va="center",
+                 color="white" if v < 60 else NAVY, fontsize=9, fontweight="bold")
+
+    ax3 = fig.add_subplot(gs[1, 0]); ax3.set_facecolor(PANEL)
+    x   = np.arange(4); w = 0.35
+    ax3.bar(x - w/2, [p_probs[h][2] * 100 for h in range(4)],
+            w, label="AD Risk", color=COLORS["AD"], alpha=0.85)
+    ax3.bar(x + w/2, [p_probs[h][1] * 100 for h in range(4)],
+            w, label="MCI Risk", color=COLORS["MCI"], alpha=0.85)
+    ax3.axhline(50, color="white", linestyle="--", alpha=0.4, linewidth=1)
+    ax3.set_xticks(x); ax3.set_xticklabels(HORIZON_NAMES, rotation=10, color="white", fontsize=9)
+    ax3.set_title("Risk Progression", color="white", fontsize=11)
+    ax3.set_ylim(0, 110); ax3.tick_params(colors="white"); ax3.spines[:].set_color("#1E3A52")
+    ax3.legend(framealpha=0, labelcolor="white"); ax3.grid(True, alpha=0.2, axis="y")
+
+    ax4 = fig.add_subplot(gs[1, 1]); ax4.set_facecolor(PANEL)
+    model_accs  = []
+    model_preds = []
+    
+    for i in range(len(model_names)):
+        if i >= len(all_probs):
+            break
+        pl = all_probs[i]
+        pp = pl[0][pid]
+        cls = np.argmax(pp)
+        model_accs.append(pp[cls] * 100)
+        model_preds.append(CLASS_SHORT[cls])
+    
+    if len(model_accs) != len(model_names):
+        min_len = min(len(model_accs), len(model_names))
+        model_accs = model_accs[:min_len]
+        model_preds = model_preds[:min_len]
+        display_names = model_names[:min_len]
+    else:
+        display_names = model_names
+    
+    bar_cols = [COLORS["CN"] if mp == "CN" else COLORS["MCI"] if mp == "MCI" else COLORS["AD"] 
+                for mp in model_preds]
+    
+    ax4.bar(range(len(display_names)), model_accs, color=bar_cols, alpha=0.85)
+    for j, (acc, pred) in enumerate(zip(model_accs, model_preds)):
+        ax4.text(j, acc + 1.5, pred, ha="center", color="white", fontsize=9, fontweight="bold")
+    
+    ax4.set_title("All Models — Present Prediction", color="white", fontsize=11)
+    ax4.set_ylim(0, 115); ax4.tick_params(colors="white", axis="y")
+    ax4.set_xticks(range(len(display_names)))
+    ax4.set_xticklabels(display_names, rotation=18, ha="right", color="white", fontsize=8)
+    ax4.spines[:].set_color("#1E3A52")
+
+    ax5 = fig.add_subplot(gs[1, 2], projection="polar")
+    ax5.set_facecolor(PANEL)
+    cats   = ["CN Prob", "MCI Prob", "AD Prob", "Avg Conf", "Max AD Risk", "Progression"]
+    ad_δ   = abs(p_probs[-1][2] - p_probs[0][2])
+    mci_δ  = abs(p_probs[-1][1] - p_probs[0][1])
+    vals   = [p_probs[0][0], p_probs[0][1], p_probs[0][2],
+              np.mean([p_probs[h][np.argmax(p_probs[h])] for h in range(4)]),
+              max(p_probs[h][2] for h in range(4)),
+              min(1.0, (ad_δ + mci_δ) * 2)]
+    angles = [n / float(len(cats)) * 2 * np.pi for n in range(len(cats))]
+    vals_c = vals + [vals[0]]; angles_c = angles + [angles[0]]
+    ax5.plot(angles_c, vals_c, "o-", linewidth=2, color=TEAL)
+    ax5.fill(angles_c, vals_c, alpha=0.22, color=TEAL)
+    ax5.set_xticks(angles); ax5.set_xticklabels(cats, size=8, color="white")
+    ax5.set_ylim(0, 1); ax5.tick_params(colors="white")
+    ax5.set_title(f"Patient #{pid} — Comprehensive Assessment",
+                  color="white", fontsize=10, fontweight="bold", pad=20)
+
+    fig.suptitle(f"Patient #{pid} — Clinical Diagnosis Report | تقرير التشخيص السريري\n"
+                 f"True: {' → '.join(CLASS_SHORT[l] for l in tl)}",
+                 color="white", fontsize=14, fontweight="bold", y=1.01)
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    patient_last_visit = Xte_last_visit[pid]
+    if len(xgb_flat_models) >= 4 and len(all_probs) > 3:
+        for i, (m_flat, hn) in enumerate(zip(xgb_flat_models, HORIZON_NAMES)):
+            try:
+                if i < len(all_probs[3]):
+                    pred_cls = int(np.argmax(all_probs[3][i][pid]))
+                    fi = run_shap_patient(m_flat, patient_last_visit, feat_names, pid, hn, pred_cls)
+                    plot_patient_shap_bar(fi, pid, hn, pdf)
+            except Exception as e:
+                print(f"    ⚠️ SHAP plot skipped for {hn}: {e}")
+
+    print(f"\n  ⚠️  Risk Assessment — Patient #{pid}:")
+    for h in range(1, 4):
+        ad_r = p_probs[h][2] * 100
+        lvl  = ("🔴 HIGH — Immediate intervention" if ad_r > 50 else
+                "🟡 MODERATE — Regular monitoring" if ad_r > 25 else
+                "🟢 LOW — Standard follow-up")
+        print(f"     {HORIZON_NAMES[h]}: AD={ad_r:.1f}%  {lvl}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — COMPARISON PDF PLOTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_learning_curves(all_curves, pdf):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.patch.set_facecolor(NAVY)
+    for ax, (tag, tr, va) in zip(axes, all_curves):
+        ax.set_facecolor(PANEL)
+        ax.plot(tr, color=TEAL, linewidth=2, label="Train")
+        ax.plot(va, color=AMBER, linewidth=2, label="Val", linestyle="--")
+        ax.set_title(tag, color="white", fontsize=12, fontweight="bold")
+        ax.tick_params(colors="white"); ax.spines[:].set_color("#1E3A52")
+        ax.legend(framealpha=0, labelcolor="white")
+        ax.set_xlabel("Epoch", color="#8899AA"); ax.set_ylabel("Loss", color="#8899AA")
+        ax.grid(True, alpha=0.2)
+    fig.suptitle("Learning Curves — M1 / M2 / M3 | منحنيات التعلم",
+                 color="white", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_metric_heatmaps(all_results, pdf):
+    model_list = list(dict.fromkeys(r["model"] for r in all_results))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.patch.set_facecolor(NAVY)
+    for ax, key, title in [(axes[0], "acc", "Accuracy % per Model & Horizon | الدقة"),
+                           (axes[1], "auc_macro", "AUC Macro % per Model & Horizon | AUC")]:
+        ax.set_facecolor(PANEL)
+        mat = np.array([[next((r[key] for r in all_results if r["model"] == mn and r["horizon"] == hn), 0)
+                         for hn in HORIZON_NAMES] for mn in model_list])
+        im = ax.imshow(mat, cmap="YlGnBu", vmin=50, vmax=100, aspect="auto")
+        ax.set_xticks(range(4)); ax.set_xticklabels(HORIZON_NAMES, color="white", fontsize=10)
+        ax.set_yticks(range(len(model_list))); ax.set_yticklabels(model_list, color="white", fontsize=9)
+        ax.set_title(title, color="white", fontsize=12, fontweight="bold", pad=10)
+        plt.colorbar(im, ax=ax).ax.yaxis.set_tick_params(color="white")
+        for (i, j), v in np.ndenumerate(mat):
+            ax.text(j, i, f"{v:.1f}", ha="center", va="center",
+                    color=NAVY if v > 80 else "white", fontsize=9, fontweight="bold")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_per_class_f1(all_results, pdf):
+    model_list = list(dict.fromkeys(r["model"] for r in all_results))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5), sharey=True)
+    fig.patch.set_facecolor(NAVY)
+    for ax, hn in zip(axes, HORIZON_NAMES):
+        ax.set_facecolor(PANEL)
+        x, w = np.arange(len(model_list)), 0.25
+        for ci, (cls, col) in enumerate(zip(CLASS_SHORT, [COLORS["CN"], COLORS["MCI"], COLORS["AD"]])):
+            vals = [next((r[f"f1_{cls}"] for r in all_results if r["model"] == mn and r["horizon"] == hn), 0)
+                    for mn in model_list]
+            ax.bar(x + ci * w, vals, w, label=cls, color=col, alpha=0.85)
+        ax.set_xticks(x + w)
+        ax.set_xticklabels(model_list, rotation=28, ha="right", color="white", fontsize=8)
+        ax.set_title(hn, color="white", fontsize=11, fontweight="bold")
+        ax.set_ylim(0, 108); ax.tick_params(colors="white"); ax.spines[:].set_color("#1E3A52")
+        ax.grid(True, alpha=0.2, axis="y")
+        if ax is axes[0]:
+            ax.set_ylabel("F1-Score (%)", color="white")
+            ax.legend(framealpha=0, labelcolor="white", fontsize=9)
+    fig.suptitle("Per-Class F1-Score by Model & Horizon | F1 لكل فئة ونموذج",
+                 color="white", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_roc_all(all_results, all_probs, model_names, Yte, pdf):
+    n = len(model_names)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
+    fig.patch.set_facecolor(NAVY)
+    if n == 1: axes = [axes]
+    ybin = label_binarize(Yte[:, 0], classes=[0, 1, 2])
+    for ax, mn, pl in zip(axes, model_names, all_probs):
+        ax.set_facecolor(PANEL)
+        probs = pl[0]
+        for c, (cls, col) in enumerate(zip(CLASS_SHORT, [COLORS["CN"], COLORS["MCI"], COLORS["AD"]])):
+            fpr, tpr, _ = roc_curve(ybin[:, c], probs[:, c])
+            ax.plot(fpr, tpr, color=col, linewidth=2.5, label=f"{cls} AUC={auc(fpr,tpr):.3f}")
+        ax.plot([0,1],[0,1],"w--", linewidth=1, alpha=0.4)
+        ax.set_title(mn, color="white", fontsize=10, fontweight="bold")
+        ax.tick_params(colors="white"); ax.spines[:].set_color("#1E3A52")
+        ax.legend(framealpha=0, labelcolor="white", fontsize=8)
+        ax.set_xlabel("FPR", color="#8899AA"); ax.set_ylabel("TPR", color="#8899AA")
+    fig.suptitle("ROC Curves — Present Horizon | منحنيات ROC",
+                 color="white", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_confusion_matrices(all_results, model_names, pdf):
+    n_models = len(model_names)
+    n_horizons = 4
+    fig, axes = plt.subplots(n_models, n_horizons, figsize=(5 * n_horizons, 4 * n_models))
+    fig.patch.set_facecolor(NAVY)
+    for ri, mn in enumerate(model_names):
+        for ci, hn in enumerate(HORIZON_NAMES):
+            ax = axes[ri][ci] if n_models > 1 else axes[ci]
+            r = next((x for x in all_results if x["model"] == mn and x["horizon"] == hn), None)
+            if r is None:
+                ax.axis("off"); continue
+            sns.heatmap(r["cm"], annot=True, fmt="d", cmap="YlGnBu",
+                        xticklabels=CLASS_SHORT, yticklabels=CLASS_SHORT,
+                        ax=ax, cbar=False, linewidths=0.3)
+            ax.set_title(f"{mn}\n{hn} Acc:{r['acc']:.1f}%", fontsize=9, fontweight="bold")
+            ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    fig.suptitle("Confusion Matrices — All Models × All Horizons", color="black", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_calibration(xgb_flat_models, Xte_last_visit, Yte, pdf):
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig.patch.set_facecolor(NAVY)
+    for ax, m, hn in zip(axes, xgb_flat_models, HORIZON_NAMES):
+        ax.set_facecolor(PANEL)
+        for c, (cls, col) in enumerate(zip(CLASS_SHORT, [COLORS["CN"], COLORS["MCI"], COLORS["AD"]])):
+            try:
+                ybin = (Yte[:, HORIZON_NAMES.index(hn)] == c).astype(int)
+                prob = m.predict_proba(Xte_last_visit)[:, c]
+                pt, pp = calibration_curve(ybin, prob, n_bins=8)
+                ax.plot(pp, pt, marker="o", color=col, linewidth=2, label=cls)
+            except Exception:
+                pass
+        ax.plot([0,1],[0,1],"w--", linewidth=1, alpha=0.5, label="Perfect")
+        ax.set_title(hn, color="white", fontsize=11, fontweight="bold")
+        ax.tick_params(colors="white"); ax.spines[:].set_color("#1E3A52")
+        ax.legend(framealpha=0, labelcolor="white", fontsize=8)
+        ax.set_xlabel("Mean Predicted", color="#8899AA")
+        ax.set_ylabel("Fraction +", color="#8899AA")
+        ax.grid(True, alpha=0.2)
+    fig.suptitle("Calibration Curves — XGBoost (Last Visit SHAP model) | منحنيات المعايرة",
+                 color="white", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_summary_table(all_results, pdf):
+    fig, ax = plt.subplots(figsize=(18, 7))
+    fig.patch.set_facecolor(NAVY); ax.set_facecolor(NAVY); ax.axis("off")
+
+    cols = ["Model", "Horizon", "Accuracy", "F1 Macro", "F1 CN", "F1 MCI",
+            "F1 AD", "AUC Macro", "AUC CN", "AUC MCI", "AUC AD"]
+    rows = [[r["model"], r["horizon"],
+             f"{r['acc']:.1f}%", f"{r['f1_macro']:.1f}%",
+             f"{r['f1_CN']:.1f}%", f"{r['f1_MCI']:.1f}%", f"{r['f1_AD']:.1f}%",
+             f"{r['auc_macro']:.1f}%",
+             f"{r['auc_CN']:.1f}%", f"{r['auc_MCI']:.1f}%", f"{r['auc_AD']:.1f}%"]
+            for r in all_results]
+
+    tbl = ax.table(cellText=rows, colLabels=cols, loc="center", cellLoc="center", colLoc="center")
+    tbl.auto_set_font_size(False); tbl.set_fontsize(8.5)
+    tbl.auto_set_column_width(list(range(len(cols))))
+    for (ri, ci), cell in tbl.get_celld().items():
+        if ri == 0:
+            cell.set_facecolor(TEAL_D); cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_facecolor(PANEL if ri % 2 == 0 else CARD)
+            cell.set_text_props(color="white")
+        cell.set_edgecolor("#1E3A52")
+    ax.set_title("📋 Full Performance Summary — All Models × Horizons", color="white", fontsize=13, fontweight="bold", pad=20)
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — MASTER PIPELINE (FINAL WITH MCI ENHANCEMENTS - FIXED)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_master_pipeline(path: str):
+    print("\n" + "🧬" * 35)
+    print("  BRAINSOVEREIGN KAN — MASTER UNIFIED SYSTEM (FINAL + MCI ENHANCED)")
+    print("  النظام الموحد الشامل للتنبؤ بمرض الزهايمر (مع تحسينات MCI)")
+    print("🧬" * 35)
+    print("\n  🆕 IMPROVEMENTS ACTIVATED:")
+    print("     ✅ Temporal difference features (ميزات الفروق الزمنية)")
+    print("     ✅ Time-specific XGBoost models with feature selection")
+    print("     ✅ Horizon-weighted loss (وزن 36 شهر = 2.0)")
+    print("     ✅ Long-term features for 36 months (ميزات المدى الطويل)")
+    print("     ✅ Simplified model for 36 months (max_depth=4, k=50)")
+    print("     ✅ Improved MetaFusion with stronger regularization")
+    print("     ✅ Long-horizon ensemble (دمج خاص للـ 24 و 36 شهر)")
+    print("     ✅ 🆕 MCI-specialized features (ميزات خاصة بـ MCI)")
+    print("     ✅ 🆕 Two-stage classifier for better MCI detection")
+    print("     ✅ 🆕 SMOTE augmentation for MCI samples")
+    print("     ✅ 🆕 Sliding windows for MCI pattern recognition")
+
+    # ── PHASE 1: Data ────────────────────────────────────────────────────────
+    Xtr, Xte, Ytr, Yte, f_cols = prepare_data(path)
+    Xtr2, Xval, Ytr2, Yval = train_test_split(Xtr, Ytr, test_size=0.15, random_state=SEED)
+
+    Xtr_last_visit = Xtr[:, -1, :]
+    Xte_last_visit = Xte[:, -1, :]
+    feat_names = f_cols
+
+    print("\n  🆕 Extracting enhanced temporal features (with long-term, MCI-specific, windows)...")
+    Xtr_enhanced = extract_enhanced_features_v3(Xtr, feat_names)
+    Xte_enhanced = extract_enhanced_features_v3(Xte, feat_names)
+    print(f"     Enhanced features shape: {Xtr_enhanced.shape[1]} features per patient")
+
+    # 🆕 SMOTE augmentation for MCI samples
+    print("\n  🆕 Applying SMOTE augmentation for MCI samples...")
+    
+    # التحقق من صحة التصنيفات
+    original_labels = Ytr[:, 0]
+    print(f"     Original label distribution: CN={np.sum(original_labels==0)}, MCI={np.sum(original_labels==1)}, AD={np.sum(original_labels==2)}")
+    
+    # تطبيق SMOTE
+    smote = SMOTE(sampling_strategy='auto', random_state=SEED, k_neighbors=3)
+    Xtr_smote, Ytr_smote = smote.fit_resample(Xtr_enhanced, original_labels)
+    print(f"     After SMOTE: {Xtr_smote.shape[0]} samples")
+    print(f"     New label distribution: CN={np.sum(Ytr_smote==0)}, MCI={np.sum(Ytr_smote==1)}, AD={np.sum(Ytr_smote==2)}")
+
+    # 🆕 Two-stage classifier for MCI
+    print("\n  🆕 Training Two-Stage MCI Classifier...")
+    mci_two_stage = TwoStageMCI_Classifier()
+    mci_two_stage.fit(Xtr_smote, Ytr_smote)
+    mci_two_stage_probs = mci_two_stage.predict_proba(Xte_enhanced)
+
+    cw = [2.0, MCI_WEIGHT, 1.0]  # زيادة وزن MCI
+    avg_feat = torch.tensor(Xtr2, dtype=torch.float32).mean(dim=0).to(device)
+
+    all_model_probs = []
+    all_results = []
+    all_curves = []
+
+    # ── PHASE 2a: M1 — GATv2 ────────────────────────────────────────────────
+    print("\n" + "─" * 70)
+    print("🕸️   PHASE 2a — M1: GATv2 Graph Network")
+    m1 = M1_GATv2(len(f_cols), hidden=128).to(device)
+    m1.build_edges(avg_feat)
+    m1, tr1, va1 = train_torch(m1, Xtr2, Ytr2, Xval, Yval,
+                                epochs=100, lr=1e-3, cw=cw, patience=10, tag="M1-GAT")
+    all_curves.append(("M1 — GATv2", tr1, va1))
+    m1_probs, _ = get_probs(m1, Xte)
+    all_model_probs.append(m1_probs)
+    print("\n  📊 M1 Results:")
+    all_results += evaluate(m1_probs, Yte, "M1_GATv2")
+    del m1; gc.collect()
+
+    # ── PHASE 2b: M2 — BiLSTM+Transformer ───────────────────────────────────
+    print("\n" + "─" * 70)
+    print("⚡   PHASE 2b — M2: BiLSTM + Transformer")
+    m2 = M2_BiLSTM_Transformer(len(f_cols), hidden=256, n_layers=3).to(device)
+    m2, tr2, va2 = train_torch(m2, Xtr2, Ytr2, Xval, Yval,
+                                epochs=100, lr=1e-3, cw=cw, patience=10, tag="M2-LSTM")
+    all_curves.append(("M2 — BiLSTM+Trans", tr2, va2))
+    m2_probs, _ = get_probs(m2, Xte)
+    all_model_probs.append(m2_probs)
+    print("\n  📊 M2 Results:")
+    all_results += evaluate(m2_probs, Yte, "M2_BiLSTM+Trans")
+    del m2; gc.collect()
+
+    # ── PHASE 2c: M3 — BrainSovereign KAN ───────────────────────────────────
+    print("\n" + "─" * 70)
+    print("🧠   PHASE 2c — M3: BrainSovereign KAN (Full Model)")
+    m3 = M3_BrainSovereign_KAN(len(f_cols), hidden=512, n_layers=6).to(device)
+    m3.build_edges(avg_feat)
+    m3, tr3, va3 = train_torch_improved(m3, Xtr2, Ytr2, Xval, Yval,
+                                         epochs=150, lr=1e-4, cw=cw, patience=12, tag="M3-Full")
+    all_curves.append(("M3 — BrainSovKAN", tr3, va3))
+
+    m3_probs_te, emb_te = get_probs(m3, Xte)
+    m3_probs_tr, emb_tr = get_probs(m3, Xtr)
+    emb_te_np = emb_te.cpu().numpy()
+    emb_tr_np = emb_tr.cpu().numpy()
+
+    all_model_probs.append(m3_probs_te)
+    print("\n  📊 M3 Results:")
+    all_results += evaluate(m3_probs_te, Yte, "M3_BrainSovKAN")
+
+    # ── PHASE 2d: M4 — Time-Specific XGBoost with Feature Selection ──────────
+    print("\n" + "─" * 70)
+    print("🌳   PHASE 2d — M4: Time-Specific XGBoost with Feature Selection")
+    
+    m4_improved = M4_TimeSpecific_XGBoost().fit(Xtr_enhanced, Ytr)
+    
+    m4_improved_probs = []
+    for i in range(4):
+        m4_improved_probs.append(m4_improved.predict_proba(Xte_enhanced, i))
+    
+    all_model_probs.append(m4_improved_probs)
+    print("\n  📊 M4 Results (Time-Specific + Feature Selection):")
+    all_results += evaluate(m4_improved_probs, Yte, "M4_XGB_Enhanced_V2")
+
+    # ── PHASE 2e: M4b — XGBoost on LAST VISIT (for SHAP only) ───────────────
+    print("\n" + "─" * 70)
+    print("🌳   PHASE 2e — M4b: XGBoost on Last Visit Features (SHAP only)")
+    print(f"     ✅ Using X[:, -1, :] — shape: {Xtr_last_visit.shape}")
+    m4_flat = M4_XGBoost_Flat().fit(Xtr_last_visit, Ytr)
+    m4b_probs = m4_flat.predict_proba_all(Xte_last_visit)
+    all_model_probs.append(m4b_probs)
+    print("\n  📊 M4b Results (reference — not in final comparison):")
+    _ = evaluate(m4b_probs, Yte, "M4b_XGB_LastVisit")
+
+    # ── PHASE 2f: M5 — Improved DeepMetaFusion ───────────────────────────────
+    print("\n" + "─" * 70)
+    print("🤝   PHASE 2f — M5: Improved DeepMetaFusion (M3 + M4)")
+    m5_probs = []
+    for i in range(4):
+        m4_probs_tr_i = m4_improved.predict_proba(Xtr_enhanced, i)
+        m_tr_i = np.hstack([m3_probs_tr[i], m4_probs_tr_i])
+        m_te_i = np.hstack([m3_probs_te[i], m4_improved_probs[i]])
+
+        meta = M5_Improved_MetaFusion(m_tr_i.shape[1]).to(device)
+        mopt = optim.Adam(meta.parameters(), lr=0.01, weight_decay=0.001)
+        
+        yt_i = torch.tensor(Ytr[:, i]).to(device)
+        mt_t = torch.tensor(m_tr_i, dtype=torch.float32).to(device)
+        
+        best_loss = float('inf')
+        patience = 20
+        trigger = 0
+        
+        horizon_weight = HORIZON_WEIGHTS[i]
+        
+        for ep in range(300):
+            mopt.zero_grad()
+            loss = horizon_weight * F.cross_entropy(meta(mt_t), yt_i, label_smoothing=0.05)
+            loss.backward()
+            mopt.step()
+            
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                trigger = 0
+            else:
+                trigger += 1
+                if trigger >= patience:
+                    break
+
+        meta.eval()
+        with torch.no_grad():
+            logits = meta(torch.tensor(m_te_i, dtype=torch.float32).to(device))
+            m5_probs.append(F.softmax(logits, dim=1).cpu().numpy())
+
+    all_model_probs.append(m5_probs)
+    print("\n  📊 M5 Results (Improved MetaFusion):")
+    all_results += evaluate(m5_probs, Yte, "M5_MetaFusion_Improved_V2")
+
+    # ── PHASE 2g: M6 — Long-Horizon Ensemble ──────────────────────────────────
+    print("\n" + "─" * 70)
+    print("🎲   PHASE 2g — M6: Long-Horizon Ensemble (24 & 36 months optimized)")
+    
+    ensemble = LongHorizonEnsemble()
+    m6_probs = []
+    for i in range(4):
+        if i in [2, 3]:
+            combined = ensemble.predict(i, m4_improved_probs[i], m5_probs[i])
+        else:
+            combined = m4_improved_probs[i]
+        m6_probs.append(combined)
+    
+    all_model_probs.append(m6_probs)
+    print("\n  📊 M6 Results (Long-Horizon Ensemble):")
+    all_results += evaluate(m6_probs, Yte, "M6_LongHorizon_Ensemble_V2")
+
+    # 🆕 PHASE 2h: M7 — Two-Stage MCI Classifier (FIXED)
+    print("\n" + "─" * 70)
+    print("🎯   PHASE 2h — M7: Two-Stage MCI Classifier (Specialized)")
+    
+    # تأكد من أن الاحتمالات بالشكل الصحيح (4 آفاق)
+    m7_probs = [mci_two_stage_probs] * 4
+    all_model_probs.append(m7_probs)
+    print("\n  📊 M7 Results (Two-Stage MCI Classifier):")
+    all_results += evaluate(m7_probs, Yte, "M7_TwoStage_MCI")
+
+    # ── Clean up and prepare final results ───────────────────────────────────
+    all_model_probs.pop(4)  # remove M4b
+    
+    final_model_names = ["M1_GATv2", "M2_BiLSTM+Trans", "M3_BrainSovKAN",
+                         "M4_XGB_Enhanced_V2", "M5_MetaFusion_Improved_V2", 
+                         "M6_LongHorizon_Ensemble_V2", "M7_TwoStage_MCI"]
+
+    # ── PHASE 3: Patient selection and diagnosis ────────────────────────────
+    print("\n" + "─" * 70)
+    print("🩺   PHASE 3 — Individual Patient Diagnosis")
+    patient_indices = []
+    for lbl in [0, 1, 2]:
+        cands = np.where(Yte[:, 0] == lbl)[0]
+        if len(cands) > 0:
+            patient_indices.append(int(cands[0]))
+    if len(patient_indices) < 2:
+        patient_indices = [0, min(5, len(Xte) - 1)]
+
+    for pid in patient_indices:
+        diagnose_patient_console(pid, Xte, Yte, all_model_probs, final_model_names)
+
+    # ── PHASE 4: PDF — Comparison Report ─────────────────────────────────────
+    print("\n" + "─" * 70)
+    print("📊   PHASE 4 — Generating Comparison PDF Report...")
+    with PdfPages("BrainSovereign_Comparison_Report_Final_MCI_Enhanced.pdf") as pdf:
+
+        fig = plt.figure(figsize=(14, 8))
+        fig.patch.set_facecolor(NAVY)
+        ax = fig.add_subplot(111); ax.set_facecolor(NAVY); ax.axis("off")
+        ax.text(0.5, 0.72, "BrainSovereign KAN — Model Comparison Report (MCI Enhanced)",
+                ha="center", fontsize=18, fontweight="bold", color="white", transform=ax.transAxes)
+        ax.text(0.5, 0.56, "مع تحسينات خاصة لـ MCI — التنبؤ بمرض الزهايمر",
+                ha="center", fontsize=14, color=TEAL, style="italic", transform=ax.transAxes)
+        ax.text(0.5, 0.40, " | ".join(final_model_names),
+                ha="center", fontsize=8, color="#8899AA", transform=ax.transAxes)
+        ax.text(0.5, 0.25, f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
+                ha="center", fontsize=10, color="#8899AA", transform=ax.transAxes)
+        ax.text(0.5, 0.12, "🆕 MCI ENHANCEMENTS: MCI-specific features | Two-stage classifier | SMOTE | Sliding windows",
+                ha="center", fontsize=8, color=AMBER, transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        final_results = [r for r in all_results if r["model"] != "M4b_XGB_LastVisit"]
+
+        plot_learning_curves(all_curves, pdf)
+        plot_metric_heatmaps(final_results, pdf)
+        plot_per_class_f1(final_results, pdf)
+        plot_roc_all(final_results, all_model_probs, final_model_names, Yte, pdf)
+        plot_confusion_matrices(final_results, final_model_names, pdf)
+        plot_calibration(m4_flat.models, Xte_last_visit, Yte, pdf)
+        plot_summary_table(final_results, pdf)
+        run_shap_global(m4_flat.models, Xte_last_visit, feat_names, pdf)
+
+    print("  ✅ Saved: BrainSovereign_Comparison_Report_Final_MCI_Enhanced.pdf")
+
+    # ── PHASE 5: PDF — Clinical Patient Report ────────────────────────────────
+    print("\n" + "─" * 70)
+    print("🩺   PHASE 5 — Generating Clinical Patient Report...")
+    with PdfPages("BrainSovereign_Clinical_Report_Final_MCI_Enhanced.pdf") as pdf:
+
+        fig = plt.figure(figsize=(14, 8))
+        fig.patch.set_facecolor(NAVY)
+        ax = fig.add_subplot(111); ax.set_facecolor(NAVY); ax.axis("off")
+        ax.text(0.5, 0.70, "BrainSovereign KAN — Clinical Diagnosis Report (MCI Enhanced)",
+                ha="center", fontsize=18, fontweight="bold", color="white", transform=ax.transAxes)
+        ax.text(0.5, 0.54, "تقرير التشخيص السريري الفردي - مع تحسينات MCI",
+                ha="center", fontsize=14, color=TEAL, style="italic", transform=ax.transAxes)
+        ax.text(0.5, 0.38, f"Patients analyzed: {patient_indices}",
+                ha="center", fontsize=11, color="#8899AA", transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        for pid in patient_indices:
+            print(f"  📋 Generating clinical page for Patient #{pid}...")
+            plot_patient_clinical(
+                pid, Yte, m3_probs_te,
+                all_model_probs, final_model_names,
+                m4_flat.models, Xte_last_visit, feat_names, pdf
+            )
+
+    print("  ✅ Saved: BrainSovereign_Clinical_Report_Final_MCI_Enhanced.pdf")
+
+    # ── PHASE 6: Final console summary ───────────────────────────────────────
+    print("\n" + "═" * 70)
+    print("📋  FINAL PERFORMANCE SUMMARY (MCI ENHANCED) | الملخص النهائي (مع تحسينات MCI)")
+    print("═" * 70)
+    final_results_clean = [r for r in all_results if r["model"] != "M4b_XGB_LastVisit"]
+    df_res = (pd.DataFrame(final_results_clean)
+              .drop(columns=["cm", "probs", "preds"])
+              .round(2))
+    print(df_res.to_string(index=False))
+
+    print("\n" + "═" * 70)
+    print("✅  ALL OUTPUTS SAVED:")
+    print("   📊  BrainSovereign_Comparison_Report_Final_MCI_Enhanced.pdf")
+    print("   🩺  BrainSovereign_Clinical_Report_Final_MCI_Enhanced.pdf")
+    print("   🖼️   clinical_correlation.png")
+    print("═" * 70)
+    print("\n🔧  MCI ENHANCEMENTS IMPLEMENTED:")
+    print("   ✅ MCI-specialized features (cognitive decline, hippocampus atrophy)")
+    print("   ✅ Two-stage classifier (normal vs abnormal → MCI vs AD)")
+    print("   ✅ SMOTE augmentation for MCI samples")
+    print("   ✅ Sliding windows for MCI pattern recognition")
+    print("   ✅ Increased MCI weight in loss function (2.5x)")
+    print("═" * 70)
+
+    return df_res
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    df = run_master_pipeline("/content/ADNI_Final_Clean_Ready.csv")
