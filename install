@@ -6,3 +6,6 @@
 
 # تثبيت باقي المكتبات التي يطلبها الكود (مثل optuna و shap) لضمان عدم توقفه لاحقاً
 !pip install optuna shap xgboost
+
+# للتأكد من تثبيت كل شيء:
+!pip install pandas numpy xgboost scikit-learn matplotlib seaborn
