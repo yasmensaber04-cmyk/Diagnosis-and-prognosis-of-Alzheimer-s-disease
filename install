@@ -1,4 +1,8 @@
-!pip install pandas numpy scikit-learn matplotlib seaborn
-!pip install xgboost shap
+# تثبيت المكتبة الأساسية
 !pip install torch-geometric
-!pip install openpyxl tqdm joblib
+
+# تثبيت المكتبات المساعدة المتوافقة مع نسخة PyTorch لديكِ
+!pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-$(python -c "import torch; print(torch.__version__)").html
+
+# تثبيت باقي المكتبات التي يطلبها الكود (مثل optuna و shap) لضمان عدم توقفه لاحقاً
+!pip install optuna shap xgboost
