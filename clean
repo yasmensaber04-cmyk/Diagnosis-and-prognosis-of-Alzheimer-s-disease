@@ -1,0 +1,116 @@
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import RobustScaler
+
+# ==============================
+# 1. Load Data
+# ==============================
+input_path = '/kaggle/input/datasets/meraja99/tadpole-d1-d2final/TADPOLE_D1_D2.csv'
+
+if not os.path.exists(input_path):
+    raise FileNotFoundError("❌ الملف غير موجود")
+
+print("⏳ Loading data...")
+df = pd.read_csv(input_path, low_memory=False)
+df.columns = df.columns.str.strip()
+
+# ==============================
+# 2. Feature Groups (بدون set عشان نحافظ على الترتيب)
+# ==============================
+identifiers = ['RID', 'VISCODE', 'EXAMDATE', 'Years_bl', 'Month_bl', 'DX', 'DX_bl']
+
+cognitive = [
+    'CDRSB','ADAS11','ADAS13','MMSE','FAQ','MOCA',
+    'RAVLT_immediate','RAVLT_learning','RAVLT_forgetting'
+]
+
+biomarkers = [
+    'APOE4','ABETA_UPENNBIOMK9_04_19_17','TAU_UPENNBIOMK9_04_19_17',
+    'PTAU_UPENNBIOMK9_04_19_17','FDG','AV45'
+]
+
+mri = ['Ventricles','Hippocampus','WholeBrain','Entorhinal','Fusiform','MidTemp','ICV']
+
+dti = [c for c in df.columns if 'DTI' in c or 'FA_' in c or 'MD_' in c or 'AD_' in c]
+
+all_features = identifiers + cognitive + biomarkers + mri + dti
+available_cols = [c for c in all_features if c in df.columns]
+
+df = df[available_cols].copy()
+
+# ==============================
+# 3. Time + Sorting
+# ==============================
+df['EXAMDATE'] = pd.to_datetime(df['EXAMDATE'], errors='coerce')
+df = df.sort_values(['RID','EXAMDATE']).reset_index(drop=True)
+
+# ==============================
+# 4. DX cleaning
+# ==============================
+dx_map = {
+    'NL':'CN','MCI to AD':'AD','Dementia':'AD',
+    'NL to MCI':'MCI','MCI to NL':'CN'
+}
+
+df['DX'] = df['DX'].replace(dx_map)
+df['DX'] = df.groupby('RID')['DX'].ffill().bfill()
+
+dx_map_num = {'CN':0,'MCI':1,'AD':2}
+df['DX_num'] = df['DX'].map(dx_map_num)
+
+# ==============================
+# 5. Missing Values Handling
+# ==============================
+
+# Cognitive → داخل نفس المريض
+for col in cognitive:
+    if col in df.columns:
+        df[col] = df.groupby('RID')[col].transform(lambda x: x.fillna(x.mean()))
+
+# Biomarkers + DTI → forward fill per patient
+static_cols = biomarkers + dti
+for col in static_cols:
+    if col in df.columns:
+        df[col] = df.groupby('RID')[col].ffill().bfill()
+
+# ==============================
+# 6. Remove patients with no DTI (correct way)
+# ==============================
+if len(dti) > 0:
+    before = df['RID'].nunique()
+    df = df.dropna(subset=dti, how='all')   # أهم تعديل هنا
+    after = df['RID'].nunique()
+    print(f"🗑️ Removed {before-after} patients without DTI")
+
+# ==============================
+# 7. Numeric conversion
+# ==============================
+exclude = ['RID','VISCODE','EXAMDATE','DX','DX_bl','DX_num']
+
+for col in df.columns:
+    if col not in exclude:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+# ❗ بدل 0 → استخدم median (أكثر علمي)
+for col in df.select_dtypes(include=[np.number]).columns:
+    df[col] = df[col].fillna(df[col].median())
+
+# ==============================
+# 8. Scaling (IMPORTANT FIX)
+# ==============================
+cols_to_scale = [c for c in df.columns if c not in exclude]
+
+scaler = RobustScaler()
+df[cols_to_scale] = scaler.fit_transform(df[cols_to_scale])
+
+# ==============================
+# 9. Save
+# ==============================
+output_file = "ADNI_CLEAN_FIXED.csv"
+df.to_csv(output_file, index=False)
+
+print("\n✅ CLEAN DATA READY")
+print("Patients:", df['RID'].nunique())
+print("Rows:", len(df))
+print("Features:", len(df.columns))
